@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# gidiff – clean git diff view for GitLernen (Work Dir → Stage → Repo)
+# Installation: install -m 755 gidiff /usr/local/bin/gidiff
+# Usage:        gidiff             all changes, before/after side by side (15 lines per file)
+#               gidiff <path>...   only these files, no line limit
+# Requires on Alpine: apk add bash git
+
+git rev-parse --git-dir &>/dev/null || { echo "Not a git repository." >&2; exit 1; }
+
+cols=${COLUMNS:-$(stty size 2>/dev/null | cut -d' ' -f2)}
+[[ -n $cols ]] || cols=80
+
+if [[ -t 1 && -z $NO_COLOR ]]; then color=1; else color=0; fi
+(( $# )) && lim=0 || lim=15
+
+G() { git -c core.quotePath=false "$@"; }
+
+{
+  echo "#head $(git symbolic-ref --short -q HEAD)"
+  echo "#W"; G diff -U0 --no-color --no-ext-diff -- "$@"
+  echo "#U"; G ls-files --others --exclude-standard -- "$@"
+  echo "#S"; G diff -U0 --cached --no-color --no-ext-diff -- "$@"
+} | LC_ALL=C awk -v cols="$cols" -v color="$color" -v lim="$lim" '
+function c(code, s)     { return color ? "\033[" code "m" s "\033[0m" : s }
+function rep(ch, n,  r) { r = ""; while (n-- > 0) r = r ch; return r }
+# byte-safe width: count UTF-8 lead bytes only, never cut inside a character
+function dlen(s)        { return length(s) - gsub(/[\200-\277]/, "", s) }
+function cut(s, w,  b, t) {
+  if (dlen(s) <= w) return s
+  b = w - 2; t = substr(s, 1, b)
+  while (dlen(t) < w - 2) t = substr(s, 1, ++b)
+  sub(/[\300-\377][\200-\277]*$/, "", t); return t ".."
+}
+# one half of the table: dim line number + colored text, padded to hw
+function side(n, t, code, pad) {
+  if (n == "") return pad ? rep(" ", hw) : ""
+  gsub(/\t/, "  ", t); t = cut(t, hw - 5)
+  return c("2", sprintf("%4d ", n)) c(code, t) (pad ? rep(" ", hw - 5 - dlen(t)) : "")
+}
+function addrow(s, sep) {
+  if (lim && tr[K] >= lim) { if (!sep) hid[K]++; return }
+  if (!sep) tr[K]++
+  tb[K] = tb[K] s "\n"
+}
+# pair removed/added lines of one hunk into before │ after rows
+function endhunk(  i, m) {
+  m = nro > nad ? nro : nad
+  if (m && hk++) addrow("   " c("2", rep("┄", hw) " ┊ " rep("┄", hw)), 1)
+  for (i = 1; i <= m; i++)
+    addrow("   " side(i <= nro ? ro[i] : "", rt[i], "31", 1) c("2", " │ ") side(i <= nad ? ao[i] : "", at[i], "32", 0))
+  nro = nad = 0
+}
+function row(s, name, stat, bar) {
+  name = cut(name, nwid)
+  print " " s " " name rep(" ", nwid - dlen(name)) "  " stat (bar != "" ? "  " bar : "")
+}
+function bar(x, y,  bx, by) {
+  bx = x; by = y
+  if (max > bw) { bx = int(x * bw / max + .5); by = int(y * bw / max + .5); if (x && !bx) bx = 1; if (y && !by) by = 1 }
+  return c("32", rep("+", bx)) c("31", rep("-", by))
+}
+function section(k, t1, c1, t2, c2, cmd,   i, K) {
+  print " " c(c1, t1) c("2", " → ") c(c2, t2) c("2", "   " cmd)
+  print " " c("2", rep("─", w))
+  if (!n[k] && !(k == "W" && nu)) print " " c("2", "(no differences)")
+  if (n[k]) print "   " c("2", "before: ") c(c2, t2) rep(" ", hw - 8 - length(t2)) c("2", " │ after: ") c(c1, t1)
+  for (i = 1; i <= n[k]; i++) {
+    K = k SUBSEP i
+    if (bin[K]) row(c(c1, sy[K]), nm[K], c("2", "binary"), "")
+    else row(c(c1, sy[K]), nm[K], c("32", sprintf("%5s", "+" (ad[K] + 0))) " " c("31", sprintf("%-4s", "-" (dl[K] + 0))), bar(ad[K], dl[K]))
+    printf "%s", tb[K]
+    if (hid[K]) print "   " c("2", "… " hid[K] " more lines · gidiff " nm[K])
+    print ""
+  }
+  if (k == "W") for (i = 1; i <= nu; i++) row(c("2", "?"), un[i], c("2", "untracked – invisible to git diff"), "")
+  if (k == "W" && nu || !n[k]) print ""
+}
+
+BEGIN {
+  cW = "1;38;5;216"; cS = "1;38;5;114"; cR = "1;38;5;111"
+  w = cols - 2; if (w > 180) w = 180; if (w < 50) w = 50
+  hw = int((w - 6) / 2)
+  fw = w < 76 ? w : 76; bw = fw - 40; if (bw > 20) bw = 20
+  nwid = fw - 16 - bw
+}
+/^#head /              { head = substr($0, 7); next }
+/^#[WUS]$/             { endhunk(); sec = substr($0, 2); next }
+sec == "U"             { un[++nu] = $0; next }
+/^diff --git /         { endhunk(); K = sec SUBSEP (++n[sec]); nm[K] = $0; sub(/.* b\//, "", nm[K]); sy[K] = "~"; inh = 1; hk = 0; next }
+inh && /^new file/     { sy[K] = "+"; next }
+inh && /^deleted file/ { sy[K] = "-"; next }
+inh && /^rename from / { rf = substr($0, 13); next }
+inh && /^rename to /   { sy[K] = ">"; nm[K] = rf " → " substr($0, 11); next }
+/^Binary files /       { bin[K] = 1; next }
+/^@@ / {
+  endhunk(); inh = 0
+  split($2, x, ","); ol = substr(x[1], 2) + 0
+  split($3, y, ","); nl = substr(y[1], 2) + 0
+  next
+}
+inh                    { next }
+/^-/                   { ro[++nro] = ol++; rt[nro] = substr($0, 2); dl[K]++; if (ad[K] + dl[K] > max) max = ad[K] + dl[K]; next }
+/^\+/                  { ao[++nad] = nl++; at[nad] = substr($0, 2); ad[K]++; if (ad[K] + dl[K] > max) max = ad[K] + dl[K]; next }
+END {
+  endhunk()
+  if (head == "") head = "detached HEAD"
+  print " " c("1", head) c("2", " · " (n["W"] + nu) " unstaged · " (n["S"] + 0) " staged"); print ""
+  section("W", "WORK DIR", cW, "STAGE", cS, "git diff")
+  section("S", "STAGE", cS, "REPO", cR, "git diff --staged")
+}
